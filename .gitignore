@@ -1,0 +1,22 @@
+# secrets
+accounts.txt
+accounts_*.txt
+
+# local outputs
+d2r_handles.txt
+*.log
+
+# local shortcuts
+*.lnk
+
+# game/runtime binaries
+D2R.exe
+D2R_loader.dll
+handle64.exe
+Diablo II Resurrected Launcher.exe
+BlizzardError.exe
+*.dll
+
+# optional package artifacts
+node_modules/
+
