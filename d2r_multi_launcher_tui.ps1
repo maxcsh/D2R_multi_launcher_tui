@@ -6,6 +6,9 @@ $script:HandleExe = Join-Path $script:Root 'handle64.exe'
 $script:OfficialLauncherExe = Join-Path $script:Root 'Diablo II Resurrected Launcher.exe'
 $script:HandlesDumpFile = Join-Path $script:Root 'd2r_handles.txt'
 $script:ModsConfigFile = Join-Path $script:Root 'mods_config.txt'
+$script:SettingsFile = Join-Path $script:Root 'settings.txt'
+$script:WindowApiInitialized = $false
+$script:RenameWindowTitleEnabled = $true
 
 function Ensure-Admin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -42,12 +45,245 @@ function Assert-Prerequisites {
     }
 }
 
+function Convert-ToBooleanSetting {
+    param(
+        [string]$RawValue,
+        [bool]$Default = $true
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RawValue)) {
+        return $Default
+    }
+
+    switch ($RawValue.Trim().ToLowerInvariant()) {
+        '1' { return $true }
+        'true' { return $true }
+        'on' { return $true }
+        'yes' { return $true }
+        'y' { return $true }
+        '0' { return $false }
+        'false' { return $false }
+        'off' { return $false }
+        'no' { return $false }
+        'n' { return $false }
+        default { return $Default }
+    }
+}
+
+function Get-LauncherSettings {
+    $settings = [ordered]@{
+        rename_window_title = $true
+    }
+
+    if (-not (Test-Path -LiteralPath $script:SettingsFile -PathType Leaf)) {
+        return [PSCustomObject]$settings
+    }
+
+    foreach ($rawLine in (Get-Content -LiteralPath $script:SettingsFile -Encoding UTF8)) {
+        $line = $rawLine.Trim()
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) {
+            continue
+        }
+
+        $parts = $line -split '=', 2
+        if ($parts.Count -lt 2) {
+            continue
+        }
+
+        $key = $parts[0].Trim().ToLowerInvariant()
+        $value = $parts[1].Trim()
+
+        switch ($key) {
+            'rename_window_title' {
+                $settings.rename_window_title = Convert-ToBooleanSetting -RawValue $value -Default $settings.rename_window_title
+            }
+            default { }
+        }
+    }
+
+    return [PSCustomObject]$settings
+}
+
+function Save-LauncherSettings {
+    param(
+        [bool]$RenameWindowTitleEnabled
+    )
+
+    $flag = if ($RenameWindowTitleEnabled) { 'true' } else { 'false' }
+    $lines = @(
+        '# D2R multi launcher settings'
+        "rename_window_title=$flag"
+    )
+
+    Set-Content -LiteralPath $script:SettingsFile -Value $lines -Encoding UTF8
+}
+
+function Initialize-WindowApi {
+    if ($script:WindowApiInitialized) {
+        return
+    }
+
+    if ("D2RWindowApi" -as [type]) {
+        $script:WindowApiInitialized = $true
+        return
+    }
+
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class D2RWindowApi {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetWindowText(IntPtr hWnd, string lpString);
+}
+"@
+
+    $script:WindowApiInitialized = $true
+}
+
+function Get-D2RPidsSnapshot {
+    return @(
+        Get-Process -Name 'D2R' -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Id
+    )
+}
+
+function Get-D2RWindowTitleText {
+    param(
+        [string]$DisplayName,
+        [string]$Region
+    )
+
+    $safeName = $DisplayName
+    if ([string]::IsNullOrWhiteSpace($safeName)) {
+        $safeName = 'Unknown'
+    }
+    $safeName = ($safeName -replace '[\r\n]+', ' ').Trim()
+
+    $safeRegion = $Region
+    if ([string]::IsNullOrWhiteSpace($safeRegion)) {
+        $safeRegion = '-'
+    }
+    $safeRegion = ($safeRegion -replace '[\r\n]+', ' ').Trim().ToLowerInvariant()
+
+    return "D2R: $safeName [$safeRegion]"
+}
+
+function Wait-NewD2RWindowTarget {
+    param(
+        [int[]]$BeforePids = @(),
+        [int]$PreferredPid = 0,
+        [int]$TimeoutMs = 15000,
+        [int]$PollIntervalMs = 250
+    )
+
+    $beforeSet = @{}
+    foreach ($existingPid in $BeforePids) {
+        $beforeSet[$existingPid] = $true
+    }
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($stopwatch.ElapsedMilliseconds -lt $TimeoutMs) {
+        $processes = @(Get-Process -Name 'D2R' -ErrorAction SilentlyContinue)
+        $candidates = New-Object System.Collections.Generic.List[object]
+
+        if ($PreferredPid -gt 0) {
+            $preferred = $processes | Where-Object { $_.Id -eq $PreferredPid } | Select-Object -First 1
+            if ($null -ne $preferred) {
+                $candidates.Add($preferred)
+            }
+        }
+
+        foreach ($process in $processes) {
+            if ($PreferredPid -gt 0 -and $process.Id -eq $PreferredPid) {
+                continue
+            }
+            if (-not $beforeSet.ContainsKey($process.Id)) {
+                $candidates.Add($process)
+            }
+        }
+
+        foreach ($candidate in $candidates) {
+            try {
+                $candidate.Refresh()
+                $windowHandle = $candidate.MainWindowHandle
+            } catch {
+                continue
+            }
+
+            if ($windowHandle -ne [IntPtr]::Zero) {
+                return [PSCustomObject]@{
+                    Pid    = $candidate.Id
+                    Handle = $windowHandle
+                }
+            }
+        }
+
+        Start-Sleep -Milliseconds $PollIntervalMs
+    }
+
+    return $null
+}
+
+function Set-D2RWindowTitleForLaunch {
+    param(
+        [int[]]$BeforePids = @(),
+        [int]$LaunchedPid = 0,
+        [string]$DisplayName,
+        [string]$Region,
+        [int]$TimeoutMs = 15000
+    )
+
+    $windowTitle = Get-D2RWindowTitleText -DisplayName $DisplayName -Region $Region
+    $target = Wait-NewD2RWindowTarget -BeforePids $BeforePids -PreferredPid $LaunchedPid -TimeoutMs $TimeoutMs
+
+    if ($null -eq $target) {
+        return [PSCustomObject]@{
+            Success     = $false
+            Warning     = "Could not find D2R window within $TimeoutMs ms."
+            WindowTitle = $windowTitle
+            WindowPid   = $null
+        }
+    }
+
+    try {
+        Initialize-WindowApi
+        $renamed = [D2RWindowApi]::SetWindowText($target.Handle, $windowTitle)
+    } catch {
+        return [PSCustomObject]@{
+            Success     = $false
+            Warning     = "Failed to set window title: $($_.Exception.Message)"
+            WindowTitle = $windowTitle
+            WindowPid   = $target.Pid
+        }
+    }
+
+    if (-not $renamed) {
+        $lastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        return [PSCustomObject]@{
+            Success     = $false
+            Warning     = "SetWindowText returned false (Win32Error=$lastError)."
+            WindowTitle = $windowTitle
+            WindowPid   = $target.Pid
+        }
+    }
+
+    return [PSCustomObject]@{
+        Success     = $true
+        Warning     = $null
+        WindowTitle = $windowTitle
+        WindowPid   = $target.Pid
+    }
+}
+
 function Show-Menu {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Title,
 
         [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
         [string[]]$Items,
 
         [string]$Prompt = 'Use Up/Down arrows, then press Enter',
@@ -61,8 +297,19 @@ function Show-Menu {
         throw 'Menu items cannot be empty.'
     }
 
-    $selected = 0
-    if ($InitialIndex -ge 0 -and $InitialIndex -lt $Items.Count) {
+    $selectable = @()
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        if (-not [string]::IsNullOrWhiteSpace($Items[$i])) {
+            $selectable += $i
+        }
+    }
+
+    if ($selectable.Count -eq 0) {
+        throw 'Menu has no selectable items.'
+    }
+
+    $selected = $selectable[0]
+    if ($InitialIndex -ge 0 -and $InitialIndex -lt $Items.Count -and -not [string]::IsNullOrWhiteSpace($Items[$InitialIndex])) {
         $selected = $InitialIndex
     }
 
@@ -72,6 +319,10 @@ function Show-Menu {
         Write-Host ''
 
         for ($i = 0; $i -lt $Items.Count; $i++) {
+            if ([string]::IsNullOrWhiteSpace($Items[$i])) {
+                Write-Host ''
+                continue
+            }
             if ($i -eq $selected) {
                 Write-Host "> $($Items[$i])" -ForegroundColor Yellow
             } else {
@@ -94,21 +345,27 @@ function Show-Menu {
 
         switch ($key.Key) {
             ([ConsoleKey]::UpArrow) {
-                if ($selected -gt 0) {
-                    $selected--
-                } else {
-                    $selected = $Items.Count - 1
-                }
+                do {
+                    if ($selected -gt 0) {
+                        $selected--
+                    } else {
+                        $selected = $Items.Count - 1
+                    }
+                } while ([string]::IsNullOrWhiteSpace($Items[$selected]))
             }
             ([ConsoleKey]::DownArrow) {
-                if ($selected -lt ($Items.Count - 1)) {
-                    $selected++
-                } else {
-                    $selected = 0
-                }
+                do {
+                    if ($selected -lt ($Items.Count - 1)) {
+                        $selected++
+                    } else {
+                        $selected = 0
+                    }
+                } while ([string]::IsNullOrWhiteSpace($Items[$selected]))
             }
             ([ConsoleKey]::Enter) {
-                return $selected
+                if (-not [string]::IsNullOrWhiteSpace($Items[$selected])) {
+                    return $selected
+                }
             }
             ([ConsoleKey]::Escape) {
                 if ($AllowBack) {
@@ -643,6 +900,9 @@ function Start-D2RClient {
         [Parameter(Mandatory = $true)]
         [string]$Region,
 
+        [Parameter(Mandatory = $true)]
+        [string]$DisplayName,
+
         [string]$Mod = '',
 
         [string[]]$ExtraArgs = @()
@@ -664,7 +924,29 @@ function Start-D2RClient {
         $args += $ExtraArgs
     }
 
-    & $script:D2rExe @args
+    $beforePids = Get-D2RPidsSnapshot
+    $startedProcess = Start-Process -FilePath $script:D2rExe -ArgumentList $args -PassThru
+    if (-not $script:RenameWindowTitleEnabled) {
+        return [PSCustomObject]@{
+            ProcessId            = $startedProcess.Id
+            WindowTitle          = $null
+            WindowRenameSuccess  = $false
+            WindowRenameWarning  = 'Window title rename is disabled by settings.'
+            WindowRenamedForPid  = $null
+            WindowRenameSkipped  = $true
+        }
+    }
+
+    $windowTitleResult = Set-D2RWindowTitleForLaunch -BeforePids $beforePids -LaunchedPid $startedProcess.Id -DisplayName $DisplayName -Region $Region
+
+    return [PSCustomObject]@{
+        ProcessId            = $startedProcess.Id
+        WindowTitle          = $windowTitleResult.WindowTitle
+        WindowRenameSuccess  = $windowTitleResult.Success
+        WindowRenameWarning  = $windowTitleResult.Warning
+        WindowRenamedForPid  = $windowTitleResult.WindowPid
+        WindowRenameSkipped  = $false
+    }
 }
 
 function Invoke-SingleClientFlow {
@@ -711,8 +993,12 @@ function Invoke-SingleClientFlow {
 
                     try {
                         $closedHandles = Close-D2RHandle
-                        Start-D2RClient -Email $account.Email -Password $account.Password -Region $region -Mod $modSelection.Mod -ExtraArgs $modSelection.Extra
-                        $lastResult = "Last launch: $($account.DisplayName) (handles closed: $closedHandles)"
+                        $launchResult = Start-D2RClient -Email $account.Email -Password $account.Password -Region $region -DisplayName $account.DisplayName -Mod $modSelection.Mod -ExtraArgs $modSelection.Extra
+                        $titleState = if ($launchResult.WindowRenameSkipped) { 'disabled' } elseif ($launchResult.WindowRenameSuccess) { 'ok' } else { 'warning' }
+                        $lastResult = "Last launch: $($account.DisplayName) (handles closed: $closedHandles, title=$titleState)"
+                        if (-not $launchResult.WindowRenameSkipped -and $launchResult.WindowRenameWarning) {
+                            $lastResult = "$lastResult | $($launchResult.WindowRenameWarning)"
+                        }
                     } catch {
                         $lastResult = "Last launch failed: $($_.Exception.Message)"
                     }
@@ -751,6 +1037,8 @@ function Invoke-MultiClientFlow {
                 $resultLines.Add('Source file: accounts.txt')
                 $resultLines.Add("Region: $region")
                 $resultLines.Add('Applied per-account mod mapping from batch editor.')
+                $renameState = if ($script:RenameWindowTitleEnabled) { 'ON' } else { 'OFF' }
+                $resultLines.Add("Window rename: $renameState")
                 $resultLines.Add("Account count: $($accounts.Count)")
                 $resultLines.Add('')
 
@@ -764,13 +1052,17 @@ function Invoke-MultiClientFlow {
 
                     try {
                         $closedHandles = Close-D2RHandle
-                        Start-D2RClient -Email $account.Email -Password $account.Password -Region $region -Mod $resolved.Mod -ExtraArgs $resolved.Extra
+                        $launchResult = Start-D2RClient -Email $account.Email -Password $account.Password -Region $region -DisplayName $account.DisplayName -Mod $resolved.Mod -ExtraArgs $resolved.Extra
 
                         $modDisplay = if ([string]::IsNullOrWhiteSpace($resolved.Mod)) { 'none' } else { $resolved.Mod }
-                        $resultLines.Add("  Success: mod=$modDisplay, closed_handles=$closedHandles")
+                        $titleSet = if ($launchResult.WindowRenameSkipped) { 'disabled' } elseif ($launchResult.WindowRenameSuccess) { 'true' } else { 'false' }
+                        $resultLines.Add("  Success: mod=$modDisplay, closed_handles=$closedHandles, window_title_set=$titleSet")
 
                         if ($resolved.Warning) {
                             $resultLines.Add("  Warning: $($resolved.Warning)")
+                        }
+                        if (-not $launchResult.WindowRenameSkipped -and $launchResult.WindowRenameWarning) {
+                            $resultLines.Add("  Warning: $($launchResult.WindowRenameWarning)")
                         }
                     } catch {
                         $resultLines.Add("  Failed: $($_.Exception.Message)")
@@ -801,27 +1093,53 @@ function Invoke-OfficialLauncher {
 function Start-Tui {
     Ensure-Admin
     Assert-Prerequisites
+    $settingsWarning = $null
+    try {
+        $settings = Get-LauncherSettings
+        $script:RenameWindowTitleEnabled = [bool]$settings.rename_window_title
+    } catch {
+        $script:RenameWindowTitleEnabled = $true
+        $settingsWarning = "Failed to load settings.txt; using defaults. $($_.Exception.Message)"
+    }
+
     try {
         $Host.UI.RawUI.WindowTitle = 'D2R Multi Launcher'
     } catch {
         # Ignore non-interactive hosts that do not support setting window title.
     }
 
+    if ($settingsWarning) {
+        Show-StatusAndWait -Title 'Settings warning' -Lines @($settingsWarning)
+    }
+
     while ($true) {
+        $renameState = if ($script:RenameWindowTitleEnabled) { 'ON' } else { 'OFF' }
         $mainItems = @(
+            "Rename Window Title: $renameState"
+            ' '
             'Single client launch'
             'Batch multi-client launch'
             'Start official launcher'
             'Exit'
         )
 
-        $selection = Show-Menu -Title 'D2R Multi Launcher' -Items $mainItems
+        $selection = Show-Menu -Title 'D2R Multi Launcher' -Items $mainItems -InitialIndex 2
 
         switch ($selection) {
-            0 { Invoke-SingleClientFlow }
-            1 { Invoke-MultiClientFlow }
-            2 { Invoke-OfficialLauncher }
-            3 {
+            0 {
+                $previousValue = $script:RenameWindowTitleEnabled
+                $script:RenameWindowTitleEnabled = -not $script:RenameWindowTitleEnabled
+                try {
+                    Save-LauncherSettings -RenameWindowTitleEnabled $script:RenameWindowTitleEnabled
+                } catch {
+                    $script:RenameWindowTitleEnabled = $previousValue
+                    Show-StatusAndWait -Title 'Settings save failed' -Lines @($_.Exception.Message)
+                }
+            }
+            2 { Invoke-SingleClientFlow }
+            3 { Invoke-MultiClientFlow }
+            4 { Invoke-OfficialLauncher }
+            5 {
                 Clear-Host
                 return
             }

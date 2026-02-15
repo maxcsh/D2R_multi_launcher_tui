@@ -1,6 +1,7 @@
 # secrets
 accounts.txt
 accounts_*.txt
+settings.txt
 
 # local outputs
 d2r_handles.txt
@@ -19,4 +20,3 @@ BlizzardError.exe
 
 # optional package artifacts
 node_modules/
-

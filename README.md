@@ -24,6 +24,7 @@ Recommended layout:
    - `run_d2r_multi_launcher_tui.cmd`
    - `accounts.txt`
    - `mods_config.txt`
+   - `settings.txt`
 2. Keep README/example files anywhere you like.
 
 If `d2r_multi_launcher_tui.ps1` is not in the same folder as `D2R.exe` and `handle64.exe`, launch will fail.
@@ -40,6 +41,7 @@ If `d2r_multi_launcher_tui.ps1` is not in the same folder as `D2R.exe` and `hand
 - `run_d2r_multi_launcher_tui.cmd`: convenience launcher
 - `accounts.txt`: account data (do not commit)
 - `mods_config.txt`: mod definitions (`mod|args`)
+- `settings.txt`: launcher settings (`key=value`)
 
 ## Quick Start (From Zero to Launch)
 1. Prepare folder location:
@@ -47,6 +49,7 @@ If `d2r_multi_launcher_tui.ps1` is not in the same folder as `D2R.exe` and `hand
 2. Prepare config files:
    - Copy `accounts.example.txt` -> `accounts.txt`
    - Copy `mods_config.example.txt` -> `mods_config.txt`
+   - Copy `settings.example.txt` -> `settings.txt`
 3. Edit `accounts.txt` with your account data.
 4. Edit `mods_config.txt` with your mod options and optional args.
 5. Launch:
@@ -83,11 +86,27 @@ Notes:
 - Mod dedupe uses `name+args` as identity:
   - `yourmod|` and `yourmod|-ns` are treated as different options
 
+### `settings.txt`
+Launcher settings in `key=value` format.
+
+Example:
+- `rename_window_title=true`
+
+Notes:
+- `rename_window_title=true` by default
+- You can toggle this in main menu: `Rename Window Title: ON/OFF`
+
 ## Key Bindings
 - `Up/Down`: move selection
 - `Left/Right`: change mod in batch editor
 - `Enter`: confirm
 - `Esc` / `Backspace`: back
+- Main menu includes `Rename Window Title: ON/OFF` (saved to `settings.txt`)
+
+## Main Menu Behavior
+- `Rename Window Title: ON/OFF` is shown on the first line.
+- A separator blank line is shown between rename toggle and launch actions.
+- Default selected item remains `Single client launch`.
 
 ## Troubleshooting
 - `Missing required files: D2R.exe`:
@@ -100,6 +119,8 @@ Notes:
   - Use Windows Terminal / PowerShell console directly (not non-interactive runners).
 - Accounts not loaded or skipped:
   - Check `accounts.txt` format: `email;password;display_name;mod(optional)`.
+- Cannot save title toggle setting:
+  - Ensure launcher folder is writable and `settings.txt` is not read-only.
 
 ## Security Notes
 - `accounts.txt` contains plaintext credentials. Never commit it.
