@@ -801,6 +801,11 @@ function Invoke-OfficialLauncher {
 function Start-Tui {
     Ensure-Admin
     Assert-Prerequisites
+    try {
+        $Host.UI.RawUI.WindowTitle = 'D2R Multi Launcher'
+    } catch {
+        # Ignore non-interactive hosts that do not support setting window title.
+    }
 
     while ($true) {
         $mainItems = @(
@@ -810,7 +815,7 @@ function Start-Tui {
             'Exit'
         )
 
-        $selection = Show-Menu -Title 'D2R Launcher TUI' -Items $mainItems
+        $selection = Show-Menu -Title 'D2R Multi Launcher' -Items $mainItems
 
         switch ($selection) {
             0 { Invoke-SingleClientFlow }
